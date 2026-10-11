@@ -37,6 +37,30 @@ cargo install --path iroh-share-gui
 cargo install --path iroh-share-tui
 ```
 
+### Optional filesystem notifications
+
+The daemon uses the original two-second directory polling by default. The
+`fs-watch` feature is an experimental opt-in prototype, not recommended for
+production yet; see the [architecture review](docs/reviews/fs-watch-architecture.md).
+To build and install it (this replaces the binary, but does not restart a daemon):
+
+```sh
+cargo install --path iroh-share --locked --features fs-watch --force
+# Or install this review branch directly:
+cargo install --git https://github.com/Shishqa/iroh-share \
+  --branch feat/notify-refresh --locked --features fs-watch --force iroh-share
+```
+
+`fs-watch` adds `notify` through an optional helper crate. Without the feature,
+that dependency is not included in the daemon's dependency graph. File events
+trigger the existing fingerprint/stability checks; manual refresh still works.
+A fallback scan is scheduled after ten minutes without a refresh wakeup, or
+after one minute if initial watcher setup fails. These are not hard periodic
+recovery deadlines: wakeups reset the timer, and runtime watcher errors do not
+yet switch to the one-minute fallback. Intervals are currently fixed.
+Filesystem notifications are not guaranteed on every backend; Android cross-app
+writes and suspend/resume need further tests.
+
 To *browse* `blake3.net` and `pkarr.net` links, you also need
 [Iroh Link Gateway][gateway] and its browser extension.
 

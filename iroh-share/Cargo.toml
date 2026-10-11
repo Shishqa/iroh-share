@@ -10,6 +10,10 @@ description = "Share and download content-addressed collections over iroh: daemo
 readme = "../README.md"
 keywords = ["iroh", "p2p", "file-sharing", "blake3", "content-addressed"]
 
+[features]
+default = []
+fs-watch = ["dep:iroh-share-watch"]
+
 [dependencies]
 hickory-proto = { version = "0.25", default-features = false, features = ["text-parsing"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
@@ -30,7 +34,7 @@ iroh.workspace = true
 iroh-blobs.workspace = true
 n0-future.workspace = true
 walkdir.workspace = true
-iroh-share-watch = { path = "../iroh-share-watch" }
+iroh-share-watch = { path = "../iroh-share-watch", optional = true }
 blake3.workspace = true
 iroh-mainline-endpoint-discovery.workspace = true
 n0-mainline.workspace = true

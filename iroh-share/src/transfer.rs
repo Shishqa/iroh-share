@@ -81,6 +81,7 @@ pub async fn run_refreshable(
     };
     // Install before import: coalesced notifications received during a transfer
     // must remain pending until the next stability check.
+    #[cfg(feature = "fs-watch")]
     let mut changes = watched.as_ref().map(|path| {
         iroh_share_watch::ChangeMonitor::watch(path).unwrap_or_else(|error| {
             tracing::warn!(%error, "file notifications unavailable; using 60-second safety scans");
@@ -126,13 +127,21 @@ pub async fn run_refreshable(
         };
         // Require two matching scans before reimporting to debounce ongoing writes.
         loop {
-            let wake = changes
-                .as_mut()
-                .expect("share has a change monitor")
-                .wait(&mut refresh, matches!(job.state, JobState::Failed { .. }))
-                .await;
-            if wake == iroh_share_watch::Wake::Manual {
-                break;
+            #[cfg(feature = "fs-watch")]
+            {
+                let wake = changes
+                    .as_mut()
+                    .expect("share has a change monitor")
+                    .wait(&mut refresh, matches!(job.state, JobState::Failed { .. }))
+                    .await;
+                if wake == iroh_share_watch::Wake::Manual {
+                    break;
+                }
+            }
+            #[cfg(not(feature = "fs-watch"))]
+            tokio::select! {
+                Some(()) = refresh.recv() => break,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
             let current = fingerprint(path).await.ok();
             if current != last || matches!(job.state, JobState::Failed { .. }) {
@@ -1333,6 +1342,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "fs-watch")]
     #[tokio::test]
     async fn notification_refresh_keeps_two_scan_debounce() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(15), async {
