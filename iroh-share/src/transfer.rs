@@ -79,6 +79,14 @@ pub async fn run_refreshable(
         JobKind::Share { path, .. } => Some(path.clone()),
         _ => None,
     };
+    // Install before import: coalesced notifications received during a transfer
+    // must remain pending until the next stability check.
+    let mut changes = watched.as_ref().map(|path| {
+        iroh_share_watch::ChangeMonitor::watch(path).unwrap_or_else(|error| {
+            tracing::warn!(%error, "file notifications unavailable; using 60-second safety scans");
+            iroh_share_watch::ChangeMonitor::polling_only()
+        })
+    });
     let mut last = None;
     let mut retained = None;
     loop {
@@ -118,9 +126,13 @@ pub async fn run_refreshable(
         };
         // Require two matching scans before reimporting to debounce ongoing writes.
         loop {
-            tokio::select! {
-                Some(()) = refresh.recv() => break,
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            let wake = changes
+                .as_mut()
+                .expect("share has a change monitor")
+                .wait(&mut refresh, matches!(job.state, JobState::Failed { .. }))
+                .await;
+            if wake == iroh_share_watch::Wake::Manual {
+                break;
             }
             let current = fingerprint(path).await.ok();
             if current != last || matches!(job.state, JobState::Failed { .. }) {
@@ -1315,6 +1327,63 @@ mod tests {
             let _ = task.await;
             endpoint.close().await;
             store.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notification_refresh_keeps_two_scan_debounce() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let root = tempfile::tempdir()?;
+            let source = root.path().join("source");
+            std::fs::create_dir(&source)?;
+            let file = source.join("file");
+            std::fs::write(&file, b"before")?;
+            let store = FsStore::load(root.path().join("store")).await?;
+            let endpoint = Endpoint::builder(presets::Minimal)
+                .bind_addr("127.0.0.1:0")?
+                .bind()
+                .await?;
+            let share = job(JobKind::Share {
+                path: source,
+                include_directory_name: false,
+            });
+            let (tx, mut rx) = mpsc::channel(128);
+            let task = tokio::spawn(run(store.as_ref().clone(), endpoint.clone(), share, tx));
+            while let Some(update) = rx.recv().await {
+                if matches!(update.state, JobState::Seeding { .. }) {
+                    break;
+                }
+            }
+            std::fs::write(&file, b"in-progress")?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            std::fs::write(&file, b"final contents")?;
+            // A notification must not bypass the original one-second stability check.
+            let premature = tokio::time::timeout(Duration::from_millis(700), async {
+                while let Some(update) = rx.recv().await {
+                    if matches!(update.state, JobState::Seeding { .. }) {
+                        return;
+                    }
+                }
+            })
+            .await;
+            assert!(premature.is_err(), "published before the two-scan debounce");
+            let next = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(update) = rx.recv().await {
+                    if matches!(update.state, JobState::Seeding { .. }) {
+                        return;
+                    }
+                }
+                panic!("share stopped before publishing");
+            })
+            .await;
+            task.abort();
+            let _ = task.await;
+            endpoint.close().await;
+            store.shutdown().await?;
+            next.context("notification refresh did not finish")?;
             Ok::<_, anyhow::Error>(())
         })
         .await??;

@@ -1,0 +1,13 @@
+[package]
+name = "iroh-share-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+notify = "8"
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

@@ -30,6 +30,7 @@ iroh.workspace = true
 iroh-blobs.workspace = true
 n0-future.workspace = true
 walkdir.workspace = true
+iroh-share-watch = { path = "../iroh-share-watch" }
 blake3.workspace = true
 iroh-mainline-endpoint-discovery.workspace = true
 n0-mainline.workspace = true
