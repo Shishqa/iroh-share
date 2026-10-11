@@ -12,7 +12,7 @@ keywords = ["iroh", "p2p", "file-sharing", "blake3", "content-addressed"]
 
 [features]
 default = []
-fs-watch = ["dep:iroh-share-watch"]
+fs-watch = ["dep:notify"]
 
 [dependencies]
 hickory-proto = { version = "0.25", default-features = false, features = ["text-parsing"] }
@@ -34,7 +34,7 @@ iroh.workspace = true
 iroh-blobs.workspace = true
 n0-future.workspace = true
 walkdir.workspace = true
-iroh-share-watch = { path = "../iroh-share-watch", optional = true }
+notify = { version = "8.2", optional = true }
 blake3.workspace = true
 iroh-mainline-endpoint-discovery.workspace = true
 n0-mainline.workspace = true
@@ -43,6 +43,7 @@ tracing-subscriber.workspace = true
 iroh-share-proto = { workspace = true, features = ["client"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 pkarr = { version = "8.0", default-features = false, features = ["signed_packet"] }
 udp-addr-index = { git = "https://github.com/n0-computer/iroh-content-discovery.git", rev = "62b399fa39c710b6f3981273dc4a4153c6ac4811" }
 bao-tree = "0.16"

@@ -1,5 +1,7 @@
 mod control;
 mod dns_records;
+#[cfg(feature = "fs-watch")]
+mod fs_watch;
 mod names;
 mod paths;
 mod recovery;
@@ -710,7 +712,7 @@ impl Actor {
                 phase,
                 include_directory_name,
                 Some(self.checkpoints_tx.clone()),
-                refresh_rx,
+                refresh_rx.into(),
             )),
         );
         self.jobs.insert(id, job.clone());

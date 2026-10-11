@@ -41,7 +41,8 @@ cargo install --path iroh-share-tui
 
 The daemon uses the original two-second directory polling by default. The
 `fs-watch` feature is an experimental opt-in prototype, not recommended for
-production yet; see the [architecture review](docs/reviews/fs-watch-architecture.md).
+production yet; see the [current architecture review](docs/reviews/fs-watch-architecture-latest.md)
+and [executed validation](docs/reviews/fs-watch-validation.md).
 To build and install it (this replaces the binary, but does not restart a daemon):
 
 ```sh
@@ -51,15 +52,36 @@ cargo install --git https://github.com/Shishqa/iroh-share \
   --branch feat/notify-refresh --locked --features fs-watch --force iroh-share
 ```
 
-`fs-watch` adds `notify` through an optional helper crate. Without the feature,
-that dependency is not included in the daemon's dependency graph. File events
-trigger the existing fingerprint/stability checks; manual refresh still works.
-A fallback scan is scheduled after ten minutes without a refresh wakeup, or
-after one minute if initial watcher setup fails. These are not hard periodic
-recovery deadlines: wakeups reset the timer, and runtime watcher errors do not
-yet switch to the one-minute fallback. Intervals are currently fixed.
-Filesystem notifications are not guaranteed on every backend; Android cross-app
-writes and suspend/resume need further tests.
+`fs-watch` adds optional `notify` directly to the daemon, with no extra package.
+Without the feature, that dependency is absent from the daemon's dependency
+graph. Events are hints for full fingerprint/stability checks, not content
+snapshots. Read/open events are filtered; unknown-path/rescan events are handled
+conservatively. Existing manual refresh restrictions are unchanged.
+
+The private scheduler keeps absolute safety deadlines (ten minutes when healthy,
+one minute when degraded); event/manual wakeups do not reset them. Unstable
+fingerprints are retried without needing another event, and failed scans/imports
+back off for thirty seconds. Automatic checks start no more than once per second,
+and fingerprint traversals are serialized across shares. Manual refresh remains
+an explicit force-import operation and bypasses those stability/rate limits.
+
+A separate blocking worker installs fresh parent/root watches at the safety
+interval and after lifecycle/errors, with at least five seconds between attempts.
+Setup and runtime failures enable minute fallback checks and registration retries.
+Worker and backend ownership are separately limited to sixteen. A backend permit
+stays with its callback handler until destruction, including retired backends
+whose shutdown is still pending. Exhaustion enables minute fallback; worker-limit
+excess shares stay in polling until restarted, while backend-limit failures retry.
+Shutdown does not block the async executor. Guarded registration/destruction
+contains notify's panic paths; this feature requires Rust's `panic=unwind`.
+
+These fixed timers are scheduling policies, not hard wall-clock guarantees:
+ongoing imports, slow filesystems, backpressure or Android sleep can delay work.
+Notifications do not make mutable referenced files into immutable snapshots.
+Native notifications currently run only on Linux/Android; other platforms use
+minute polling with this feature. Android cross-app writes and suspend/resume
+still need deployment-specific testing. See the
+[current review](docs/reviews/fs-watch-architecture-latest.md) for validation scope.
 
 To *browse* `blake3.net` and `pkarr.net` links, you also need
 [Iroh Link Gateway][gateway] and its browser extension.

@@ -58,13 +58,28 @@ pub async fn run_saved(
         phase,
         include_directory_name,
         checkpoints,
-        refresh_rx,
+        refresh_rx.into(),
     )
     .await
 }
 
+pub(crate) struct RefreshControl {
+    refresh: mpsc::Receiver<()>,
+    #[cfg(all(test, feature = "fs-watch"))]
+    idle: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl From<mpsc::Receiver<()>> for RefreshControl {
+    fn from(refresh: mpsc::Receiver<()>) -> Self {
+        Self {
+            refresh,
+            #[cfg(all(test, feature = "fs-watch"))]
+            idle: None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn run_refreshable(
+pub(crate) async fn run_refreshable(
     store: Store,
     endpoint: Endpoint,
     mut job: Job,
@@ -73,8 +88,13 @@ pub async fn run_refreshable(
     // Ticket imports only; shares carry their layout in the job kind.
     include_directory_name: bool,
     checkpoints: Option<mpsc::Sender<Checkpoint>>,
-    mut refresh: mpsc::Receiver<()>,
+    control: RefreshControl,
 ) {
+    let RefreshControl {
+        mut refresh,
+        #[cfg(all(test, feature = "fs-watch"))]
+        mut idle,
+    } = control;
     let watched = match &job.kind {
         JobKind::Share { path, .. } => Some(path.clone()),
         _ => None,
@@ -82,12 +102,9 @@ pub async fn run_refreshable(
     // Install before import: coalesced notifications received during a transfer
     // must remain pending until the next stability check.
     #[cfg(feature = "fs-watch")]
-    let mut changes = watched.as_ref().map(|path| {
-        iroh_share_watch::ChangeMonitor::watch(path).unwrap_or_else(|error| {
-            tracing::warn!(%error, "file notifications unavailable; using 60-second safety scans");
-            iroh_share_watch::ChangeMonitor::polling_only()
-        })
-    });
+    let mut changes = watched
+        .as_ref()
+        .map(|path| crate::fs_watch::Monitor::new(path));
     let mut last = None;
     let mut retained = None;
     loop {
@@ -111,6 +128,12 @@ pub async fn run_refreshable(
                 last = before;
             }
             Err(error) => {
+                #[cfg(feature = "fs-watch")]
+                if let Some(changes) = &mut changes {
+                    // A fresh import error must replace old scan/stability retry
+                    // deadlines, including after an explicit manual import.
+                    changes.scan_failed();
+                }
                 job.state = JobState::Failed {
                     error: JobError {
                         message: format!("{error:#}"),
@@ -128,36 +151,82 @@ pub async fn run_refreshable(
         // Require two matching scans before reimporting to debounce ongoing writes.
         loop {
             #[cfg(feature = "fs-watch")]
-            {
-                let wake = changes
-                    .as_mut()
-                    .expect("share has a change monitor")
-                    .wait(&mut refresh, matches!(job.state, JobState::Failed { .. }))
-                    .await;
-                if wake == iroh_share_watch::Wake::Manual {
-                    break;
+            let changes = changes.as_mut().expect("share has a change monitor");
+            #[cfg(all(test, feature = "fs-watch"))]
+            if changes.quiet() {
+                if let Some(ack) = idle.take() {
+                    let _ = ack.send(());
                 }
+            }
+            #[cfg(feature = "fs-watch")]
+            if changes.wait(&mut refresh).await == crate::fs_watch::Wake::Manual {
+                break;
             }
             #[cfg(not(feature = "fs-watch"))]
             tokio::select! {
                 Some(()) = refresh.recv() => break,
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
-            let current = fingerprint(path).await.ok();
+            let current_result = fingerprint(path).await;
+            #[cfg(feature = "fs-watch")]
+            if let Err(error) = &current_result {
+                tracing::warn!(%error, "cannot fingerprint shared path; retrying later");
+                changes.scan_failed();
+                continue;
+            }
+            let current = current_result.ok();
             if current != last || matches!(job.state, JobState::Failed { .. }) {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if fingerprint(path).await.ok() == current {
+                #[cfg(not(feature = "fs-watch"))]
+                let stable = {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    fingerprint(path).await.ok() == current
+                };
+                #[cfg(feature = "fs-watch")]
+                let stable =
+                    match confirm_stability(current, async { fingerprint(path).await.map(Some) })
+                        .await
+                    {
+                        Ok(stable) => stable,
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot confirm shared path; retrying later");
+                            changes.scan_failed();
+                            continue;
+                        }
+                    };
+                if stable {
+                    #[cfg(feature = "fs-watch")]
+                    changes.confirmed();
                     break;
                 }
+                #[cfg(feature = "fs-watch")]
+                changes.unstable();
+            } else {
+                #[cfg(feature = "fs-watch")]
+                changes.confirmed();
             }
         }
         // Keep the prior collection pinned while its replacement is imported.
     }
 }
 
+#[cfg(feature = "fs-watch")]
+async fn confirm_stability<T: PartialEq>(
+    first: T,
+    second: impl std::future::Future<Output = Result<T>>,
+) -> Result<bool> {
+    // Poll the second read only after the quiet interval. This small boundary is
+    // tested with virtual time, independently of notification/snapshot scheduling.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Ok(second.await? == first)
+}
+
 async fn fingerprint(path: &Path) -> Result<blake3::Hash> {
+    #[cfg(feature = "fs-watch")]
+    let permit = crate::fs_watch::scan_permit().await;
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "fs-watch")]
+        let _permit = permit;
         let mut entries = Vec::new();
         for entry in walkdir::WalkDir::new(path).sort_by_file_name() {
             let entry = entry?;
@@ -1286,6 +1355,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "fs-watch"), target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn shared_directory_changes_retarget_name() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(20), async {
@@ -1343,8 +1413,29 @@ mod tests {
     }
 
     #[cfg(feature = "fs-watch")]
+    #[tokio::test(start_paused = true)]
+    async fn stability_delay_precedes_second_read_and_handles_changes_and_errors() -> Result<()> {
+        for (second, expected) in [
+            (Ok(1u8), Some(true)),
+            (Ok(2u8), Some(false)),
+            (Err(anyhow::anyhow!("synthetic scan error")), None),
+        ] {
+            let start = tokio::time::Instant::now();
+            let result = confirm_stability(1u8, async {
+                // Removing the actual delay must fail here, even with slow
+                // endpoint cleanup, permit contention or notification delivery.
+                assert_eq!(start.elapsed(), Duration::from_secs(1));
+                second
+            })
+            .await;
+            assert_eq!(result.ok(), expected);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "fs-watch", any(target_os = "linux", target_os = "android")))]
     #[tokio::test]
-    async fn notification_refresh_keeps_two_scan_debounce() -> Result<()> {
+    async fn notification_refresh_publishes_final_bytes() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(15), async {
             let root = tempfile::tempdir()?;
             let source = root.path().join("source");
@@ -1361,29 +1452,40 @@ mod tests {
                 include_directory_name: false,
             });
             let (tx, mut rx) = mpsc::channel(128);
-            let task = tokio::spawn(run(store.as_ref().clone(), endpoint.clone(), share, tx));
+            let (_refresh, refresh_rx) = mpsc::channel(1);
+            let (idle, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(run_refreshable(
+                store.as_ref().clone(),
+                endpoint.clone(),
+                share,
+                tx,
+                DownloadPhase::Downloading,
+                true,
+                None,
+                RefreshControl {
+                    refresh: refresh_rx,
+                    idle: Some(idle),
+                },
+            ));
             while let Some(update) = rx.recv().await {
                 if matches!(update.state, JobState::Seeding { .. }) {
                     break;
                 }
             }
-            std::fs::write(&file, b"in-progress")?;
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // A healthy watcher alone is insufficient: its installation signal
+            // must already have completed the initial automatic content check.
+            tokio::time::timeout(Duration::from_secs(5), ready).await??;
+            while let Ok(update) = rx.try_recv() {
+                assert!(
+                    !matches!(update.state, JobState::Seeding { .. }),
+                    "unexpected initial republication"
+                );
+            }
             std::fs::write(&file, b"final contents")?;
-            // A notification must not bypass the original one-second stability check.
-            let premature = tokio::time::timeout(Duration::from_millis(700), async {
-                while let Some(update) = rx.recv().await {
-                    if matches!(update.state, JobState::Seeding { .. }) {
-                        return;
-                    }
-                }
-            })
-            .await;
-            assert!(premature.is_err(), "published before the two-scan debounce");
             let next = tokio::time::timeout(Duration::from_secs(5), async {
                 while let Some(update) = rx.recv().await {
                     if matches!(update.state, JobState::Seeding { .. }) {
-                        return;
+                        return update;
                     }
                 }
                 panic!("share stopped before publishing");
@@ -1392,8 +1494,26 @@ mod tests {
             task.abort();
             let _ = task.await;
             endpoint.close().await;
+            let update = next.context("notification refresh did not finish")?;
+            let ticket = seed_ticket(&update);
+            let expected: Collection = [("file", Hash::new(b"final contents"))]
+                .into_iter()
+                .collect();
+            let expected_hash = Hash::new(expected.to_blobs().last().expect("collection root"));
+            assert_eq!(ticket.hash(), expected_hash);
+            assert_eq!(
+                Collection::load(ticket.hash(), store.as_ref()).await?,
+                expected
+            );
+            assert_eq!(
+                store
+                    .as_ref()
+                    .get_bytes(Hash::new(b"final contents"))
+                    .await?
+                    .as_ref(),
+                b"final contents"
+            );
             store.shutdown().await?;
-            next.context("notification refresh did not finish")?;
             Ok::<_, anyhow::Error>(())
         })
         .await??;

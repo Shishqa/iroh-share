@@ -2734,11 +2734,11 @@ dependencies = [
  "iroh-blobs",
  "iroh-mainline-endpoint-discovery",
  "iroh-share-proto",
- "iroh-share-watch",
  "irpc",
  "irpc-iroh",
  "n0-future",
  "n0-mainline",
+ "notify",
  "pkarr",
  "plist",
  "rand 0.10.3",
@@ -2811,15 +2811,6 @@ dependencies = [
  "tokio",
  "webbrowser",
  "z32",
-]
-
-[[package]]
-name = "iroh-share-watch"
-version = "0.1.10"
-dependencies = [
- "notify",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
