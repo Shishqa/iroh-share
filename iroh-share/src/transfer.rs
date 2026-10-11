@@ -28,7 +28,16 @@ use tokio::sync::{mpsc, watch};
 
 #[cfg(test)]
 pub async fn run(store: Store, endpoint: Endpoint, job: Job, tx: mpsc::Sender<Job>) {
-    run_saved(store, endpoint, job, tx, DownloadPhase::Downloading, None).await
+    run_saved(
+        store,
+        endpoint,
+        job,
+        tx,
+        DownloadPhase::Downloading,
+        true,
+        None,
+    )
+    .await
 }
 #[cfg(test)]
 pub async fn run_saved(
@@ -37,18 +46,32 @@ pub async fn run_saved(
     job: Job,
     tx: mpsc::Sender<Job>,
     phase: DownloadPhase,
+    include_directory_name: bool,
     checkpoints: Option<mpsc::Sender<Checkpoint>>,
 ) {
     let (_refresh_tx, refresh_rx) = mpsc::channel(1);
-    run_refreshable(store, endpoint, job, tx, phase, checkpoints, refresh_rx).await
+    run_refreshable(
+        store,
+        endpoint,
+        job,
+        tx,
+        phase,
+        include_directory_name,
+        checkpoints,
+        refresh_rx,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_refreshable(
     store: Store,
     endpoint: Endpoint,
     mut job: Job,
     tx: mpsc::Sender<Job>,
     phase: DownloadPhase,
+    // Ticket imports only; shares carry their layout in the job kind.
+    include_directory_name: bool,
     checkpoints: Option<mpsc::Sender<Checkpoint>>,
     mut refresh: mpsc::Receiver<()>,
 ) {
@@ -69,6 +92,7 @@ pub async fn run_refreshable(
             &mut job,
             &tx,
             phase,
+            include_directory_name,
             checkpoints.as_ref(),
         )
         .await
@@ -153,7 +177,16 @@ async fn transfer(
     job: &mut Job,
     tx: &mpsc::Sender<Job>,
 ) -> Result<TempTag> {
-    transfer_saved(store, endpoint, job, tx, DownloadPhase::Downloading, None).await
+    transfer_saved(
+        store,
+        endpoint,
+        job,
+        tx,
+        DownloadPhase::Downloading,
+        true,
+        None,
+    )
+    .await
 }
 async fn transfer_saved(
     store: &Store,
@@ -161,6 +194,7 @@ async fn transfer_saved(
     job: &mut Job,
     tx: &mpsc::Sender<Job>,
     phase: DownloadPhase,
+    include_directory_name: bool,
     checkpoints: Option<&mpsc::Sender<Checkpoint>>,
 ) -> Result<TempTag> {
     let tag = match job.kind.clone() {
@@ -188,9 +222,16 @@ async fn transfer_saved(
                         .is_complete(),
                     "seed data is no longer complete"
                 );
+                // The stripped collection is derived, so it is rebuilt rather than tagged.
+                let tag = if include_directory_name {
+                    tag
+                } else {
+                    let collection = Collection::load(source.hash(), store).await?;
+                    strip_directory_name(&collection)?.store(store).await?
+                };
                 job.state = JobState::Seeding {
                     active_uploads: 0,
-                    ticket: BlobTicket::new(endpoint.addr(), source.hash(), BlobFormat::HashSeq),
+                    ticket: BlobTicket::new(endpoint.addr(), tag.hash(), BlobFormat::HashSeq),
                 };
                 return Ok(tag);
             }
@@ -227,11 +268,19 @@ async fn transfer_saved(
                 "incomplete download"
             );
             let collection = Collection::load(source.hash(), store).await?;
+            // Seed the stripped collection; it reuses the downloaded file blobs.
+            let (collection, tag) = if include_directory_name {
+                (collection, tag)
+            } else {
+                let collection = strip_directory_name(&collection)?;
+                let tag = collection.clone().store(store).await?;
+                (collection, tag)
+            };
             checkpoint(checkpoints, job.id, DownloadPhase::Exporting).await?;
             export(
                 store,
                 &collection,
-                source.hash(),
+                tag.hash(),
                 &target,
                 job,
                 tx,
@@ -455,6 +504,29 @@ async fn import(
     let root = collection.store(store).await?;
     drop(tags);
     Ok(root)
+}
+
+/// Drop the single top-level directory that contains every file. Refuse
+/// anything else rather than guess: an already flat collection is ambiguous.
+fn strip_directory_name(collection: &Collection) -> Result<Collection> {
+    ensure!(!collection.is_empty(), "the collection is empty");
+    let mut directory = None;
+    collection
+        .iter()
+        .map(|(name, hash)| {
+            let (top, rest) = name.split_once('/').with_context(|| {
+                format!("cannot drop the directory name: {name} is not inside a directory")
+            })?;
+            match directory {
+                None => directory = Some(top),
+                Some(directory) => ensure!(
+                    directory == top,
+                    "cannot drop the directory name: the collection has several top-level directories"
+                ),
+            }
+            Ok((rest.to_owned(), *hash))
+        })
+        .collect()
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -774,6 +846,7 @@ mod tests {
                 &mut download,
                 &tx,
                 DownloadPhase::Downloading,
+                true,
                 Some(&checkpoints)
             ),
             observer
@@ -961,6 +1034,7 @@ mod tests {
                 &mut download,
                 &tx,
                 DownloadPhase::Downloading,
+                true,
                 None,
             )
             .await?;
@@ -1029,6 +1103,7 @@ mod tests {
             &mut download,
             &tx,
             DownloadPhase::Exporting,
+            true,
             None,
         )
         .await?;
@@ -1043,6 +1118,7 @@ mod tests {
             &mut download,
             &tx,
             DownloadPhase::Exporting,
+            true,
             None,
         )
         .await?;
@@ -1060,6 +1136,7 @@ mod tests {
             &mut download,
             &tx,
             DownloadPhase::Seeding,
+            true,
             None,
         )
         .await?;
@@ -1079,11 +1156,107 @@ mod tests {
             &mut conflict,
             &tx,
             DownloadPhase::Exporting,
+            true,
             None
         )
         .await
         .is_err());
         assert_eq!(std::fs::read(other.join("first"))?, b"keep me");
+        drop(seed);
+        drop(tx);
+        drain.await?;
+        endpoint.close().await;
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn strip_directory_name_requires_one_top_level_directory() -> Result<()> {
+        let hash = Hash::new(b"x");
+        let collection = |names: &[&str]| -> Collection {
+            names.iter().map(|name| (name.to_string(), hash)).collect()
+        };
+        let stripped = strip_directory_name(&collection(&["site/a/b", "site/index.html"]))?;
+        let names: Vec<_> = stripped.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["a/b", "index.html"]);
+        for names in [
+            &[][..],
+            &["index.html"],
+            &["site/index.html", "other/x"],
+            &["site/x", "y"],
+        ] {
+            assert!(strip_directory_name(&collection(names)).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_without_directory_name_exports_and_seeds_stripped_collection() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("store");
+        let store = FsStore::load(&store_path).await?;
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let page = store.add_bytes(b"page".to_vec()).await?;
+        let style = store.add_bytes(b"style".to_vec()).await?;
+        let collection: Collection = vec![
+            ("site/css/style.css".to_owned(), style.hash),
+            ("site/index.html".to_owned(), page.hash),
+        ]
+        .into_iter()
+        .collect();
+        let source = collection.store(&store).await?;
+        let ticket = BlobTicket::new(
+            iroh::SecretKey::from_bytes(&[9; 32]).public().into(),
+            source.hash(),
+            BlobFormat::HashSeq,
+        );
+        let target = root.path().join("target");
+        std::fs::create_dir(&target)?;
+        let (tx, mut rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut download = job(JobKind::Download {
+            source: ticket.try_into()?,
+            target: target.clone(),
+        });
+        let tag = transfer_saved(
+            &store,
+            &endpoint,
+            &mut download,
+            &tx,
+            DownloadPhase::Downloading,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(std::fs::read(target.join("index.html"))?, b"page");
+        assert_eq!(std::fs::read(target.join("css/style.css"))?, b"style");
+        assert!(!target.join("site").exists());
+        let seeded = seed_ticket(&download).hash();
+        assert_ne!(seeded, source.hash());
+        assert_eq!(seeded, tag.hash());
+        let stripped = Collection::load(seeded, store.as_ref()).await?;
+        assert!(stripped
+            .iter()
+            .any(|(name, hash)| name == "index.html" && *hash == page.hash));
+        // After a restart the stripped root is rebuilt with the same hash.
+        drop((tag, page, style, source));
+        store.shutdown().await?;
+        let store = FsStore::load(&store_path).await?;
+        let seed = transfer_saved(
+            &store,
+            &endpoint,
+            &mut download,
+            &tx,
+            DownloadPhase::Seeding,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(seed.hash(), seeded);
+        assert_eq!(seed_ticket(&download).hash(), seeded);
         drop(seed);
         drop(tx);
         drain.await?;

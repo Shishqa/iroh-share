@@ -84,6 +84,25 @@ a failed transfer can be retried with another ticket on the same row. Keep the
 sender running until import completes. Both import variants use the shared typed
 `DownloadSource` parser; the GUI's publishing dialog accepts collection tickets.
 
+`ImportWithOptions { source, id, include_directory_name, announce }` sets the
+layout and the Mainline announcement explicitly. New data is created with its
+announcement setting in the same step, so `announce: false` is never announced,
+not even briefly; on an update it changes the setting like `SetAnnounce`. With `include_directory_name: false` the daemon drops the
+collection's single top-level directory after download, exporting and seeding a
+new collection (new hash, same file blobs); a collection with top-level files or
+several top-level directories fails rather than guessing. The layout is stored
+daemon-side, not in `Job`: a plain `Import` creates data that keeps its paths and
+updates data with the layout remembered for that ID.
+
+`SetAnnounce { id, announce }` turns Mainline announcement of one data item's
+content hash on or off; it stays seeding, and the setting survives updates and
+restarts. `WatchAnnounce` streams `AnnounceSnapshot { enabled, disabled }`, once
+on subscribe and on every change; `enabled` is false under `--no-announce`. It is
+separate from `Watch` so `Job` and `WatchEvent` stay compatible. Daemons from
+0.1.10 and earlier close the connection on unknown requests, so clients open
+`WatchAnnounce` on its own connection, hide the setting if it fails, and only
+send `SetAnnounce` once it works.
+
 `Refresh { id }` explicitly rescans a shared local directory followed by at least
 one `NameTarget::Job` name. Files, downloads, unnamed directories and busy imports
 are rejected. Refresh keeps the same data ID and names; linked names follow the

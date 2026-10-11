@@ -2,7 +2,7 @@
 #[cfg(feature = "client")]
 pub mod client;
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use irpc::{
     channel::{mpsc, oneshot},
@@ -46,11 +46,53 @@ pub struct Share {
 }
 
 /// Fetch into the daemon's public import directory and seed; retain names when updating.
+///
+/// New data keeps the collection's paths. Updates reuse the layout chosen when
+/// the data was imported; see [`ImportWithOptions`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
     pub source: DownloadSource,
     /// Update existing data while retaining its ID and linked names; None creates data.
     pub id: Option<u64>,
+}
+
+/// [`Import`] with an explicit layout, remembered for later updates of the data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportWithOptions {
+    pub source: DownloadSource,
+    /// Update existing data while retaining its ID and linked names; None creates data.
+    pub id: Option<u64>,
+    /// False drops the collection's single top-level directory, which yields a
+    /// new collection hash. Fails if the collection has no such directory.
+    pub include_directory_name: bool,
+    /// False keeps the data off Mainline, as [`SetAnnounce`] does. New data is
+    /// created with this setting, so it is never announced, not even briefly.
+    pub announce: bool,
+}
+
+/// Turn Mainline announcement of one data item's content hash on or off.
+///
+/// Off keeps seeding: direct tickets still work, but blake3.net links and
+/// provider discovery can no longer find this daemon for that content.
+/// The choice persists across updates and restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetAnnounce {
+    pub id: u64,
+    pub announce: bool,
+}
+
+/// Stream [`AnnounceSnapshot`]s: one immediately, then one per change.
+///
+/// Separate from [`Watch`] so `Job` and `WatchEvent` stay compatible with older clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchAnnounce {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnounceSnapshot {
+    /// False when the daemon runs with `--no-announce`; nothing is announced.
+    pub enabled: bool,
+    /// Data IDs whose announcement is turned off; all others are announced while seeding.
+    pub disabled: BTreeSet<u64>,
 }
 
 /// Report the default public destination on the daemon's filesystem.
@@ -276,4 +318,10 @@ pub enum ControlProtocol {
     ExportName(ExportName),
     #[rpc(tx=oneshot::Sender<RpcResult<Vec<ImportedName>>>)]
     ImportNames(ImportNames),
+    #[rpc(tx=oneshot::Sender<RpcResult<Job>>)]
+    ImportWithOptions(ImportWithOptions),
+    #[rpc(tx=oneshot::Sender<RpcResult<()>>)]
+    SetAnnounce(SetAnnounce),
+    #[rpc(tx=mpsc::Sender<RpcResult<AnnounceSnapshot>>)]
+    WatchAnnounce(WatchAnnounce),
 }

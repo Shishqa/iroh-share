@@ -102,7 +102,12 @@ struct App {
     import_source: String,
     import_label: String,
     import_id: Option<u64>,
+    import_include_directory_name: bool,
+    /// Whether new imports are announced on Mainline.
+    import_announce: bool,
     import_directory: Option<PathBuf>,
+    /// None hides the Mainline toggle, for daemons that predate it.
+    announce: Option<iroh_share_proto::AnnounceSnapshot>,
     download_source: String,
     download_target: String,
     download_discover: bool,
@@ -203,6 +208,9 @@ impl App {
             import_source: String::new(),
             import_label: String::new(),
             import_id: None,
+            import_include_directory_name: true,
+            import_announce: true,
+            announce: None,
             import_directory: None,
             download_source: String::new(),
             download_target: String::new(),
@@ -281,6 +289,7 @@ impl App {
         self.import_open = false;
         self.import_id = None;
         self.import_directory = None;
+        self.announce = None;
         self.import_source.clear();
         self.editing_name = false;
         self.name_editor_open = false;
@@ -438,6 +447,7 @@ impl App {
                     WatchEvent::GatewayUpdated(_) => {}
                 },
                 Update::ImportDirectory(path) => self.import_directory = Some(path),
+                Update::Announce(snapshot) => self.announce = snapshot,
                 Update::Imported { job, name_error } => {
                     self.busy = false;
                     self.import_open = false;
@@ -701,6 +711,24 @@ impl App {
             0 => {
                 ui.checkbox(&mut self.include_directory_name, "Include directory name");
             }
+            // Updates re-apply the layout chosen when the data was imported.
+            1 if self.import_id.is_none() => {
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.import_include_directory_name,
+                        "Include directory name",
+                    );
+                    if let Some(announce) = &self.announce {
+                        let labels = [
+                            "Will be announced on Mainline. Click to keep it off Mainline from the start.",
+                            "Will not be announced on Mainline; only direct tickets work. Click to announce.",
+                        ];
+                        if mainline_toggle(ui, announce.enabled, self.import_announce, true, labels) {
+                            self.import_announce = !self.import_announce;
+                        }
+                    }
+                });
+            }
             1 => {}
             _ => {
                 ui.add(
@@ -736,6 +764,12 @@ impl App {
                     .map(|source| Action::Import {
                         source,
                         id: self.import_id,
+                        include_directory_name: self.import_id.is_some()
+                            || self.import_include_directory_name,
+                        // Only new data shows the toggle; updates keep their setting.
+                        announce: self.import_id.is_some()
+                            || self.import_announce
+                            || self.announce.as_ref().is_none_or(|a| !a.enabled),
                         label: None,
                     }),
                 2 if !self.download_target.trim().is_empty() => self
@@ -857,6 +891,16 @@ impl App {
                                             &ticket.hash().to_hex(),
                                             "Copy BLAKE3 hash (hex)",
                                         );
+                                        if let Some(announce) = &self.announce {
+                                            let on = !announce.disabled.contains(&job.id);
+                                            let labels = [
+                                                "Announced on Mainline, so blake3.net links can find it. Click to stop.",
+                                                "Not announced on Mainline; only direct tickets work. Click to announce.",
+                                            ];
+                                            if mainline_toggle(ui, announce.enabled, on, self.ready && !self.busy, labels) {
+                                                self.send(Action::SetAnnounce { id: job.id, announce: !on });
+                                            }
+                                        }
                                     });
                                 } else {
                                     row_line(ui, |ui| { ui.weak("Content link available after import"); });
@@ -1557,6 +1601,10 @@ enum Icon {
     Check,
     Open,
     Trash,
+    /// Announced on Mainline.
+    World,
+    /// Not announced on Mainline: the globe, struck through.
+    WorldOff,
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response {
@@ -1640,9 +1688,61 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response {
                 line((7.0, 7.0), (7.0, 12.0));
                 line((9.0, 7.0), (9.0, 12.0));
             }
+            Icon::World | Icon::WorldOff => {
+                // A globe: outline, equator, two parallels and a meridian.
+                painter.circle_stroke(point(8.0, 8.0), 7.0, stroke);
+                line((1.0, 8.0), (15.0, 8.0));
+                line((2.5, 4.5), (13.5, 4.5));
+                line((2.5, 11.5), (13.5, 11.5));
+                let meridian = (0..=16)
+                    .map(|i| {
+                        let angle = std::f32::consts::TAU * i as f32 / 16.0;
+                        point(8.0 + 3.0 * angle.cos(), 8.0 + 7.0 * angle.sin())
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(meridian, stroke));
+                if matches!(icon, Icon::WorldOff) {
+                    // Clear a gap around the strike so it reads against the globe.
+                    let fill = ui.style().interact(&response).weak_bg_fill;
+                    painter.line_segment(
+                        [point(1.0, 1.0), point(15.0, 15.0)],
+                        egui::Stroke::new(stroke.width + 3.0, fill),
+                    );
+                    line((1.0, 1.0), (15.0, 15.0));
+                }
+            }
         }
     }
     response
+}
+
+/// The world icon for Mainline announcement, struck through when off.
+///
+/// `labels` are the tooltips for on and off. Returns whether it was clicked.
+/// When the daemon announces nothing, it shows struck through and disabled.
+fn mainline_toggle(
+    ui: &mut egui::Ui,
+    daemon_enabled: bool,
+    on: bool,
+    enabled: bool,
+    labels: [&str; 2],
+) -> bool {
+    if !daemon_enabled {
+        ui.add_enabled_ui(false, |ui| {
+            icon_button(ui, Icon::WorldOff, "Not announced on Mainline").on_disabled_hover_text(
+                "Mainline announcements are off for this daemon (--no-announce)",
+            );
+        });
+        return false;
+    }
+    let (icon, label) = if on {
+        (Icon::World, labels[0])
+    } else {
+        (Icon::WorldOff, labels[1])
+    };
+    ui.add_enabled_ui(enabled, |ui| icon_button(ui, icon, label))
+        .inner
+        .clicked()
 }
 
 /// A compact link label, an icon to copy it, and one to open it.

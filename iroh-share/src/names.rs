@@ -2,8 +2,8 @@
 use crate::recovery::{DownloadPhase, SavedData};
 use anyhow::{ensure, Context, Result};
 use iroh_share_proto::{
-    ImportOutcome, ImportedName, Job, JobError, JobKind, JobState, Name, NameKey, NameState,
-    NameTarget, Url,
+    AnnounceSnapshot, ImportOutcome, ImportedName, Job, JobError, JobKind, JobState, Name, NameKey,
+    NameState, NameTarget, Url,
 };
 use n0_mainline::{Dht, MutableItem, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use simple_dns::{
     Packet, ResourceRecord, CLASS,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -43,6 +43,9 @@ struct Database {
     shares: BTreeMap<u64, PathBuf>,
     #[serde(default)]
     data: BTreeMap<u64, SavedData>,
+    /// Data whose content hash is not announced on Mainline.
+    #[serde(default)]
+    unannounced: BTreeSet<u64>,
 }
 
 pub struct Names {
@@ -322,10 +325,10 @@ impl Names {
         self.db = db;
         Ok(())
     }
-    pub fn replace_job(&mut self, id: u64, kind: &JobKind) -> Result<()> {
+    pub fn replace_job(&mut self, id: u64, saved: SavedData) -> Result<()> {
         let mut db = self.db.clone();
         ensure!(db.data.contains_key(&id), "unknown data");
-        db.data.insert(id, SavedData::new(kind));
+        db.data.insert(id, saved);
         db.shares.remove(&id);
         for entry in db.entries.values_mut() {
             if entry.target == NameTarget::Job(id) {
@@ -335,16 +338,43 @@ impl Names {
         self.commit(db)
     }
 
+    #[cfg(test)]
     pub fn allocate_job(&mut self, kind: &JobKind) -> Result<u64> {
+        self.allocate_saved(SavedData::new(kind), true)
+    }
+    /// Saves new data, with its announcement setting in the same write.
+    pub fn allocate_saved(&mut self, saved: SavedData, announce: bool) -> Result<u64> {
         let mut db = self.db.clone();
         let id = db.next_job_id;
         db.next_job_id = id.checked_add(1).context("job id exhausted")?;
-        db.data.insert(id, SavedData::new(kind));
-        if let JobKind::Share { path, .. } = kind {
+        if !announce {
+            db.unannounced.insert(id);
+        }
+        if let SavedData::Share { path, .. } = &saved {
             db.shares.insert(id, path.clone());
         }
+        db.data.insert(id, saved);
         self.commit(db)?;
         Ok(id)
+    }
+    pub fn saved(&self, id: u64) -> Option<&SavedData> {
+        self.db.data.get(&id)
+    }
+    pub fn set_announce(&mut self, id: u64, announce: bool) -> Result<()> {
+        let mut db = self.db.clone();
+        ensure!(db.data.contains_key(&id), "unknown data");
+        if announce {
+            db.unannounced.remove(&id);
+        } else {
+            db.unannounced.insert(id);
+        }
+        self.commit(db)
+    }
+    pub fn announce_snapshot(&self) -> AnnounceSnapshot {
+        AnnounceSnapshot {
+            enabled: self.enabled,
+            disabled: self.db.unannounced.clone(),
+        }
     }
     #[cfg(test)]
     pub fn restored_shares(&self) -> BTreeMap<u64, PathBuf> {
@@ -464,6 +494,7 @@ impl Names {
         let mut db = self.db.clone();
         db.shares.remove(&id);
         db.data.remove(&id);
+        db.unannounced.remove(&id);
         for entry in db.entries.values_mut() {
             if entry.target == NameTarget::Job(id) {
                 entry.share_path = None;

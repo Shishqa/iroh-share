@@ -22,6 +22,11 @@ Without `--state-dir`, the daemon and CLI use this per-user location:
 `--state-dir` overrides this location.
 
 Use `daemon --no-announce` to disable Mainline announcements and name publication for local testing.
+To stop announcing a single item, click its globe icon in the GUI (struck through
+when off) or press a in the TUI. It keeps seeding for direct tickets, but
+blake3.net links can no longer find it on this daemon. To keep an imported
+ticket off Mainline from the start, turn off the globe on the Import ticket line
+(Ctrl+A in the TUI import prompt) before importing.
 Endpoint indexers come from the signed server list maintained by n0, a Pkarr
 record resolved through Mainline. Logs go to stderr; set `RUST_LOG` to change the
 default `warn,iroh_share=info` filter. `--no-announce` skips discovery.
@@ -111,6 +116,13 @@ Directory shares expose their contents at the collection root by default. Use
 directory basename. The GUI has an Include directory name checkbox; Ctrl+R
 toggles it in the TUI share prompt. The choice persists across refreshes and
 restarts. Existing saved shares retain their layout.
+
+`sendme send <dir>` always puts files under the directory's name. Ticket imports
+keep that layout by default; uncheck **Include directory name** in Import ticket
+(Ctrl+R in the TUI import prompt) to serve the directory's contents at the root
+instead. The daemon then seeds a new collection with its own hash, and fails if
+the ticket has no single top-level directory. **Update from ticket** keeps the
+choice made at import.
 
 ## Downloading
 

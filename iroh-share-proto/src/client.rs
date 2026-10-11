@@ -19,6 +19,7 @@ pub fn default_state_dir() -> Result<PathBuf> {
 pub struct ControlClient {
     client: Client<ControlProtocol>,
     endpoint: Endpoint,
+    addr: EndpointAddr,
     remote: bool,
 }
 
@@ -26,8 +27,9 @@ impl ControlClient {
     /// Use a caller-owned iroh endpoint, including an embedded UI's identity.
     pub fn from_endpoint(endpoint: Endpoint, addr: EndpointAddr) -> Self {
         Self {
-            client: irpc_iroh::client(endpoint.clone(), addr, crate::CONTROL_ALPN),
+            client: irpc_iroh::client(endpoint.clone(), addr.clone(), crate::CONTROL_ALPN),
             endpoint,
+            addr,
             remote: true,
         }
     }
@@ -165,6 +167,30 @@ impl ControlClient {
         .map_err(anyhow::Error::msg)
     }
 
+    /// Like [`Self::import`], but sets the layout instead of keeping the paths
+    /// (new data) or reusing the remembered layout (updates), and sets the
+    /// Mainline announcement.
+    pub async fn import_with_options(
+        &self,
+        source: crate::DownloadSource,
+        id: Option<u64>,
+        include_directory_name: bool,
+        announce: bool,
+    ) -> Result<Job> {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.client.rpc(crate::ImportWithOptions {
+                source,
+                id,
+                include_directory_name,
+                announce,
+            }),
+        )
+        .await
+        .context("import request timed out; check data before retrying")??
+        .map_err(anyhow::Error::msg)
+    }
+
     pub async fn import_directory(&self) -> Result<PathBuf> {
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -229,6 +255,39 @@ impl ControlClient {
         .await
         .context("watch request timed out")?
         .map_err(Into::into)
+    }
+
+    /// Stream per-data Mainline announcement state.
+    ///
+    /// Uses its own connection: a daemon from 0.1.10 or earlier closes the
+    /// connection on this unknown request, which must not take down [`Self::watch`].
+    /// Fails, or the stream ends, if the daemon does not support it.
+    pub async fn watch_announce(
+        &self,
+    ) -> Result<mpsc::Receiver<RpcResult<crate::AnnounceSnapshot>>> {
+        let client: Client<ControlProtocol> = irpc_iroh::client(
+            self.endpoint.clone(),
+            self.addr.clone(),
+            crate::CONTROL_ALPN,
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.server_streaming(crate::WatchAnnounce {}, 8),
+        )
+        .await
+        .context("announce watch request timed out")?
+        .map_err(Into::into)
+    }
+
+    /// Only send this to a daemon whose [`Self::watch_announce`] works.
+    pub async fn set_announce(&self, id: u64, announce: bool) -> Result<()> {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.client.rpc(crate::SetAnnounce { id, announce }),
+        )
+        .await
+        .context("announce request timed out")??
+        .map_err(anyhow::Error::msg)
     }
 }
 

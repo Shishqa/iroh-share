@@ -89,7 +89,13 @@ struct App {
     details_scroll: u16,
     downloads_open: bool,
     include_directory_name: bool,
+    /// Negated so a new import keeps the directory name by default.
+    import_without_directory_name: bool,
+    /// Negated so a new import is announced on Mainline by default.
+    import_unannounced: bool,
     import_directory: Option<PathBuf>,
+    /// None hides Mainline settings, for daemons that predate them.
+    announce: Option<iroh_share_proto::AnnounceSnapshot>,
     pending_input: Option<Input>,
 }
 
@@ -97,6 +103,7 @@ impl App {
     fn update(&mut self, update: Update) {
         match update {
             Update::ImportDirectory(path) => self.import_directory = Some(path),
+            Update::Announce(snapshot) => self.announce = snapshot,
             Update::Added { job, new } => {
                 self.busy = false;
                 self.pending_input = None;
@@ -160,6 +167,7 @@ impl App {
     fn reset_session(&mut self) {
         self.model.reset();
         self.import_directory = None;
+        self.announce = None;
         self.pending_input = None;
         self.input = Input::Browse;
         self.completion.reset();
@@ -257,6 +265,29 @@ impl App {
             && key.code == KeyCode::Char('r')
         {
             self.include_directory_name = !self.include_directory_name;
+            return false;
+        }
+        // Updates re-apply the layout chosen when the data was imported.
+        if matches!(self.input, Input::Import { id: None, .. })
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('r')
+        {
+            if key.kind != KeyEventKind::Release {
+                self.import_without_directory_name = !self.import_without_directory_name;
+            }
+            return false;
+        }
+        if matches!(self.input, Input::Import { id: None, .. })
+            && self
+                .announce
+                .as_ref()
+                .is_some_and(|announce| announce.enabled)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('a')
+        {
+            if key.kind != KeyEventKind::Release {
+                self.import_unannounced = !self.import_unannounced;
+            }
             return false;
         }
         if key.kind == KeyEventKind::Release {
@@ -445,6 +476,21 @@ impl App {
                         }
                     }
                 }
+                KeyCode::Char('a') if !self.names_view && self.model.ready && !self.busy => {
+                    match (&self.announce, self.model.selected) {
+                        (None, _) => {
+                            self.status = "This daemon does not support Mainline settings".into()
+                        }
+                        (Some(announce), _) if !announce.enabled => {
+                            self.status = "Mainline announcements are off for this daemon".into()
+                        }
+                        (Some(announce), Some(id)) => {
+                            let announce = announce.disabled.contains(&id);
+                            self.submit(Action::SetAnnounce { id, announce }, tx);
+                        }
+                        (Some(_), None) => {}
+                    }
+                }
                 KeyCode::Char('s') if self.model.ready && !self.busy => {
                     self.input = Input::Share(String::new())
                 }
@@ -590,7 +636,19 @@ impl App {
                     .map_err(|e| e.to_string())
                     .and_then(|ticket| DownloadSource::try_from(ticket).map_err(|e| e.to_string()))
                 {
-                    Ok(source) => self.submit(Action::Import { source, id }, tx),
+                    Ok(source) => self.submit(
+                        Action::Import {
+                            source,
+                            id,
+                            include_directory_name: id.is_some()
+                                || !self.import_without_directory_name,
+                            // Only new data has the toggle; updates keep their setting.
+                            announce: id.is_some()
+                                || !self.import_unannounced
+                                || self.announce.as_ref().is_none_or(|a| !a.enabled),
+                        },
+                        tx,
+                    ),
                     Err(error) => {
                         self.status = format!("Invalid ticket: {error}");
                         self.input = Input::Import { value, id };
@@ -835,6 +893,15 @@ impl App {
                 .and_then(|id| self.model.jobs.get(&id))
                 .map(|job| {
                     let mut details = job_details(job);
+                    if let Some(announce) = &self.announce {
+                        details.push_str(if !announce.enabled {
+                            "\nMainline: off for this daemon"
+                        } else if announce.disabled.contains(&job.id) {
+                            "\nMainline: not announced  [a announce]"
+                        } else {
+                            "\nMainline: announced  [a stop]"
+                        });
+                    }
                     for name in self
                         .model
                         .names
@@ -872,7 +939,7 @@ impl App {
             Paragraph::new(if self.names_view {
                 "n Create · e Retarget · x Remove · c Copy URL · o Open · ↑/↓ Select"
             } else {
-                "s Publish · i Import · u Update · r Refresh · n Name · c Copy · t Ticket · o Open · x Remove"
+                "s Publish · i Import · u Update · r Refresh · n Name · a Mainline · c Copy · t Ticket · o Open · x Remove"
             }).cyan(),
             actions,
         );
@@ -955,11 +1022,32 @@ impl App {
                         } else {
                             clean(&self.completion.hint())
                         }
-                    } else if matches!(self.input, Input::Import { .. }) {
-                        self.import_directory
+                    } else if let Input::Import { id, .. } = &self.input {
+                        let folder = self
+                            .import_directory
                             .as_ref()
                             .map(|path| format!("Import folder on daemon: {}", path.display()))
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        if id.is_some() {
+                            folder
+                        } else {
+                            let mut hint = format!(
+                                "{folder}\nCtrl+R: include directory name [{}]",
+                                if self.import_without_directory_name {
+                                    "off"
+                                } else {
+                                    "on"
+                                }
+                            );
+                            if self.announce.as_ref().is_some_and(|a| a.enabled) {
+                                hint.push_str(if self.import_unannounced {
+                                    " · Ctrl+A: announce on Mainline [off]"
+                                } else {
+                                    " · Ctrl+A: announce on Mainline [on]"
+                                });
+                            }
+                            hint
+                        }
                     } else {
                         String::new()
                     }
@@ -1301,7 +1389,7 @@ mod tests {
         app.paste(ticket.clone());
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         assert!(
-            matches!(rx.try_recv()?, Action::Import { source, id: None } if source.hash == hash)
+            matches!(rx.try_recv()?, Action::Import { source, id: None, include_directory_name: true, announce: true } if source.hash == hash)
         );
         assert!(app.busy);
         app.update(Update::ActionResult(Err("try again".into())));
@@ -1309,7 +1397,75 @@ mod tests {
         app.update(Update::Disconnected("offline".into()));
         assert!(matches!(app.input, Input::Browse));
         assert!(app.pending_input.is_none());
+        // With announce settings, Ctrl+A keeps a new import off Mainline.
+        app.update(Update::Event(WatchEvent::SnapshotComplete));
+        app.update(Update::Announce(Some(iroh_share_proto::AnnounceSnapshot {
+            enabled: true,
+            disabled: Default::default(),
+        })));
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        app.key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        app.paste(ticket);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(matches!(
+            rx.try_recv()?,
+            Action::Import {
+                id: None,
+                announce: false,
+                ..
+            }
+        ));
         Ok(())
+    }
+
+    #[test]
+    fn a_toggles_mainline_only_when_the_daemon_supports_it() {
+        let mut app = App::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.update(Update::Event(WatchEvent::JobUpdated(Box::new(Job {
+            id: 1,
+            kind: JobKind::Share {
+                path: "/site".into(),
+                include_directory_name: false,
+            },
+            state: JobState::Queued,
+        }))));
+        app.update(Update::Event(WatchEvent::SnapshotComplete));
+        let press = |app: &mut App| {
+            app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+            app.busy = false;
+        };
+        press(&mut app);
+        assert!(rx.try_recv().is_err());
+        app.update(Update::Announce(Some(iroh_share_proto::AnnounceSnapshot {
+            enabled: true,
+            disabled: Default::default(),
+        })));
+        press(&mut app);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::SetAnnounce {
+                id: 1,
+                announce: false
+            })
+        ));
+        app.update(Update::Announce(Some(iroh_share_proto::AnnounceSnapshot {
+            enabled: true,
+            disabled: [1].into(),
+        })));
+        press(&mut app);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::SetAnnounce {
+                id: 1,
+                announce: true
+            })
+        ));
+        app.update(Update::Disconnected("offline".into()));
+        assert!(app.announce.is_none());
     }
 
     #[test]

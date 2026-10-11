@@ -23,6 +23,12 @@ pub enum Action {
     Import {
         source: DownloadSource,
         id: Option<u64>,
+        /// False drops the top-level directory. True keeps the paths of new
+        /// data and the remembered layout of updated data.
+        include_directory_name: bool,
+        /// False keeps new data off Mainline from the start. True announces
+        /// new data and keeps the setting of updated data.
+        announce: bool,
         label: Option<String>,
     },
     ShareMany(Vec<PathBuf>),
@@ -40,6 +46,10 @@ pub enum Action {
         target: iroh_share_proto::NameTarget,
     },
     RemoveName(String),
+    SetAnnounce {
+        id: u64,
+        announce: bool,
+    },
 }
 
 pub enum Update {
@@ -57,6 +67,8 @@ pub enum Update {
         name_error: Option<String>,
     },
     ImportDirectory(PathBuf),
+    /// None when the daemon predates per-data announcement settings.
+    Announce(Option<iroh_share_proto::AnnounceSnapshot>),
     Connecting,
     Event(WatchEvent),
     Disconnected(String),
@@ -127,10 +139,22 @@ async fn session(
     tokio::time::timeout(Duration::from_secs(15), snapshot)
         .await
         .context("initial snapshot timed out")??;
+    // Older daemons drop the probe's own connection; the session carries on without it.
+    let mut announce = client.watch_announce().await.ok();
     let mut completions = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = tx.closed() => return Ok(()),
+            snapshot = async { announce.as_mut().expect("guarded").recv().await }, if announce.is_some() => {
+                let snapshot = match snapshot {
+                    Ok(Some(Ok(snapshot))) => Some(snapshot),
+                    _ => {
+                        announce = None;
+                        None
+                    }
+                };
+                tx.send(Update::Announce(snapshot)).await?;
+            }
             event = events.recv() => {
                 let event = event?.context("daemon disconnected")?.map_err(anyhow::Error::msg)?;
                 tx.send(Update::Event(event)).await?;
@@ -177,8 +201,14 @@ async fn session(
                         }
                         Ok(format!("Shared {added} paths{}", if errors.is_empty() { String::new() } else { format!("; {}", errors.join("; ")) }))
                     }
-                    Action::Import { source, id, label } => {
-                        match client.import(source, id).await {
+                    Action::Import { source, id, include_directory_name, announce, label } => {
+                        // The plain request also works with daemons that predate the options.
+                        let result = if include_directory_name && announce {
+                            client.import(source, id).await
+                        } else {
+                            client.import_with_options(source, id, include_directory_name, announce).await
+                        };
+                        match result {
                             Ok(job) => {
                                 let name_error = if let Some(label) = label {
                                     client.create_name(label, iroh_share_proto::NameTarget::Job(job.id)).await.err().map(|e| format!("{e:#}"))
@@ -189,6 +219,9 @@ async fn session(
                             Err(error) => Err(error),
                         }
                     }
+                    Action::SetAnnounce { id, announce } => client.set_announce(id, announce).await.map(|()| {
+                        if announce { "Announcing on Mainline".to_owned() } else { "Stopped announcing on Mainline; direct tickets still work".to_owned() }
+                    }),
                     Action::Refresh(id) => client.refresh(id).await.map(|()| "Refreshing directory… Its name will follow the updated content.".into()),
                     Action::Publish { path, label, include_directory_name } => {
                         match client.share_with_options(path, include_directory_name).await {

@@ -135,6 +135,21 @@ opt-in checkbox in the GUI, Ctrl+R in the TUI share prompt, and
 The layout choice persists with the share and applies to refreshes. Saved shares
 without a layout option include the directory name to preserve their layout.
 
+Each seeding row has a Mainline toggle: a globe icon in the GUI, struck through
+when the content hash is not announced, and a in the TUI. Announcing is on by
+default. Turning it off keeps seeding for direct tickets but blake3.net links and
+provider discovery stop finding this daemon. Under `--no-announce` the GUI shows
+the struck-through globe disabled; clients hide the toggle for older daemons.
+The GUI Import ticket line has the same globe next to Include directory name
+(Ctrl+A in the TUI import prompt), so imported data can stay off Mainline from
+the start. Share a path and Download do not have it yet.
+
+Ticket imports keep the sender's paths by default, so `sendme send site` imports
+as site/index.html. Unchecking Include directory name in the GUI Import ticket
+mode (Ctrl+R in the TUI import prompt) drops that single top-level directory,
+which changes the collection hash. Update from ticket shows no toggle; it
+re-applies the layout chosen at import.
+
 The Names panel offers Export all pkarr names, including content-bound names.
 Use a local save-file picker and identify that the ZIP includes private keys.
 No aliases are needed in the backup; each entry is identified by its public key.

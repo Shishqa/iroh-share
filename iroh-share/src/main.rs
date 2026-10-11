@@ -160,6 +160,8 @@ struct Actor {
     updates_rx: mpsc::Receiver<Job>,
     uploads: watch::Receiver<BTreeMap<Hash, u32>>,
     announcements: watch::Sender<std::collections::HashSet<Hash>>,
+    /// Per-data announcement settings, for `WatchAnnounce` streams.
+    announce_settings: watch::Sender<iroh_share_proto::AnnounceSnapshot>,
 }
 
 impl Actor {
@@ -333,15 +335,50 @@ impl Actor {
                 }
                 ControlMessage::Import(message) => {
                     let result = self
-                        .import_ticket(message.inner.source, message.inner.id)
+                        .import_ticket(message.inner.source, message.inner.id, None, None)
                         .await;
-                    if let Ok(job) = &result {
-                        self.refresh_announcements();
-                        self.refresh_names().await;
-                        self.broadcast(WatchEvent::JobUpdated(Box::new(job.clone())))
-                            .await;
-                    }
+                    self.imported(&result).await;
                     let _ = message.tx.send(result).await;
+                }
+                ControlMessage::ImportWithOptions(message) => {
+                    let WithChannels { inner, tx, .. } = message;
+                    let result = self
+                        .import_ticket(
+                            inner.source,
+                            inner.id,
+                            Some(inner.include_directory_name),
+                            Some(inner.announce),
+                        )
+                        .await;
+                    self.imported(&result).await;
+                    let _ = tx.send(result).await;
+                }
+                ControlMessage::SetAnnounce(message) => {
+                    let WithChannels { inner, tx, .. } = message;
+                    let result = if self.jobs.contains_key(&inner.id) {
+                        self.names
+                            .set_announce(inner.id, inner.announce)
+                            .map_err(|e| e.to_string())
+                    } else {
+                        Err("This data is no longer available".into())
+                    };
+                    self.refresh_announcements();
+                    let _ = tx.send(result).await;
+                }
+                ControlMessage::WatchAnnounce(message) => {
+                    let mut settings = self.announce_settings.subscribe();
+                    tokio::spawn(async move {
+                        loop {
+                            let snapshot = settings.borrow_and_update().clone();
+                            if message.tx.send(Ok(snapshot)).await.is_err() {
+                                break;
+                            }
+                            tokio::select! {
+                                changed = settings.changed() => if changed.is_err() { break },
+                                _ = message.tx.closed() => break,
+                            }
+                        }
+                    });
                 }
                 ControlMessage::Refresh(message) => {
                     let result = self.request_refresh(message.inner.id);
@@ -467,15 +504,22 @@ impl Actor {
     }
 
     fn refresh_announcements(&self) {
+        let snapshot = self.names.announce_snapshot();
         self.announcements.send_replace(
             self.jobs
                 .values()
+                .filter(|job| !snapshot.disabled.contains(&job.id))
                 .filter_map(|job| match &job.state {
                     JobState::Seeding { ticket, .. } => Some(ticket.hash()),
                     _ => None,
                 })
                 .collect(),
         );
+        self.announce_settings.send_if_modified(|current| {
+            let changed = *current != snapshot;
+            *current = snapshot;
+            changed
+        });
     }
 
     async fn broadcast(&mut self, event: WatchEvent) {
@@ -488,7 +532,25 @@ impl Actor {
         self.watchers = active;
     }
 
-    async fn import_ticket(&mut self, source: DownloadSource, id: Option<u64>) -> RpcResult<Job> {
+    async fn imported(&mut self, result: &RpcResult<Job>) {
+        if let Ok(job) = result {
+            self.refresh_announcements();
+            self.refresh_names().await;
+            self.broadcast(WatchEvent::JobUpdated(Box::new(job.clone())))
+                .await;
+        }
+    }
+
+    /// Without an explicit layout, new data keeps its paths and updates reuse
+    /// the layout of the data they replace. Likewise, without an explicit
+    /// announcement new data is announced and updates keep their setting.
+    async fn import_ticket(
+        &mut self,
+        source: DownloadSource,
+        id: Option<u64>,
+        include_directory_name: Option<bool>,
+        announce: Option<bool>,
+    ) -> RpcResult<Job> {
         source.validate().map_err(|e| e.to_string())?;
         if let Some(id) = id {
             let job = self
@@ -513,8 +575,22 @@ impl Actor {
         let target = target.canonicalize().map_err(|e| e.to_string())?;
         let kind = JobKind::Download { source, target };
         let Some(id) = id else {
-            return self.start(kind);
+            return self.start_saved(
+                recovery::SavedData::import(&kind, include_directory_name.unwrap_or(true)),
+                announce.unwrap_or(true),
+            );
         };
+        if let Some(announce) = announce {
+            self.names
+                .set_announce(id, announce)
+                .map_err(|e| e.to_string())?;
+        }
+        let include_directory_name = include_directory_name.unwrap_or_else(|| {
+            self.names
+                .saved(id)
+                .is_none_or(recovery::SavedData::include_directory_name)
+        });
+        let saved = recovery::SavedData::import(&kind, include_directory_name);
         // Keep the previous collection rooted while the replacement is fetched.
         if let JobState::Seeding { ticket, .. } = &self.jobs[&id].state {
             self.store
@@ -527,7 +603,7 @@ impl Actor {
                 .map_err(|e| e.to_string())?;
         }
         self.names
-            .replace_job(id, &kind)
+            .replace_job(id, saved.clone())
             .map_err(|e| e.to_string())?;
         if let Some(task) = self.tasks.remove(&id) {
             task.abort();
@@ -540,7 +616,7 @@ impl Actor {
                 self.broadcast(WatchEvent::JobUpdated(Box::new(job))).await;
             }
         }
-        Ok(self.spawn_job(id, kind))
+        Ok(self.spawn_saved(id, saved))
     }
 
     fn request_refresh(&self, id: u64) -> RpcResult<()> {
@@ -575,7 +651,13 @@ impl Actor {
             .map_err(|_| "A refresh is already pending or the share worker stopped".into())
     }
 
-    fn start(&mut self, mut kind: JobKind) -> RpcResult<Job> {
+    fn start(&mut self, kind: JobKind) -> RpcResult<Job> {
+        self.start_saved(recovery::SavedData::new(&kind), true)
+    }
+
+    fn start_saved(&mut self, saved: recovery::SavedData, announce: bool) -> RpcResult<Job> {
+        let include_directory_name = saved.include_directory_name();
+        let mut kind = saved.kind();
         let path = match &mut kind {
             JobKind::Share { path, .. } => path,
             JobKind::Download { target, .. } => target,
@@ -598,15 +680,18 @@ impl Actor {
                 }
             }
         }
-        let id = self.names.allocate_job(&kind).map_err(|e| e.to_string())?;
-        Ok(self.spawn_job(id, kind))
+        // Shares carry their layout in the kind; this only sets it for downloads.
+        let saved = recovery::SavedData::import(&kind, include_directory_name);
+        let id = self
+            .names
+            .allocate_saved(saved.clone(), announce)
+            .map_err(|e| e.to_string())?;
+        Ok(self.spawn_saved(id, saved))
     }
 
-    fn spawn_job(&mut self, id: u64, kind: JobKind) -> Job {
-        self.spawn_saved(id, recovery::SavedData::new(&kind))
-    }
     fn spawn_saved(&mut self, id: u64, saved: recovery::SavedData) -> Job {
         let phase = saved.phase();
+        let include_directory_name = saved.include_directory_name();
         let kind = saved.kind();
         let job = Job {
             id,
@@ -623,6 +708,7 @@ impl Actor {
                 job.clone(),
                 self.updates_tx.clone(),
                 phase,
+                include_directory_name,
                 Some(self.checkpoints_tx.clone()),
                 refresh_rx,
             )),
@@ -760,6 +846,7 @@ async fn daemon(
     };
     let (checkpoints_tx, checkpoints_rx) = mpsc::channel(64);
     let mut actor = Actor {
+        announce_settings: watch::channel(names.announce_snapshot()).0,
         rx,
         jobs: BTreeMap::new(),
         tasks: BTreeMap::new(),
@@ -1020,6 +1107,7 @@ mod tests {
         let (_name_updates_tx, name_updates_rx) = mpsc::channel(128);
         let (checkpoints_tx, checkpoints_rx) = mpsc::channel(64);
         let actor = Actor {
+            announce_settings: watch::channel(names.announce_snapshot()).0,
             rx,
             jobs: BTreeMap::new(),
             tasks: BTreeMap::new(),
@@ -1257,6 +1345,56 @@ mod tests {
                 _ => None,
             })
             .context("missing seeded directory")?;
+        let mut announce = client
+            .server_streaming(iroh_share_proto::WatchAnnounce {}, 8)
+            .await?;
+        let initial = announce.recv().await?.context("no announce snapshot")?;
+        assert!(initial.map_err(anyhow::Error::msg)?.disabled.is_empty());
+        assert!(hashes.borrow().contains(&ticket.hash()));
+        client
+            .rpc(iroh_share_proto::SetAnnounce {
+                id: shared.id,
+                announce: false,
+            })
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let off = announce.recv().await?.context("no announce update")?;
+        assert!(off
+            .map_err(anyhow::Error::msg)?
+            .disabled
+            .contains(&shared.id));
+        assert!(!hashes.borrow().contains(&ticket.hash()));
+        client
+            .rpc(iroh_share_proto::SetAnnounce {
+                id: shared.id,
+                announce: true,
+            })
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let on = announce.recv().await?.context("no announce update")?;
+        assert!(on.map_err(anyhow::Error::msg)?.disabled.is_empty());
+        assert!(hashes.borrow().contains(&ticket.hash()));
+        // New data can start unannounced, set in the same step that creates it.
+        let quiet = client
+            .rpc(iroh_share_proto::ImportWithOptions {
+                source: ticket.clone().try_into()?,
+                id: None,
+                include_directory_name: true,
+                announce: false,
+            })
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let off = announce.recv().await?.context("no announce update")?;
+        assert!(off
+            .map_err(anyhow::Error::msg)?
+            .disabled
+            .contains(&quiet.id));
+        client
+            .rpc(Remove { id: quiet.id })
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let gone = announce.recv().await?.context("no announce update")?;
+        assert!(gone.map_err(anyhow::Error::msg)?.disabled.is_empty());
         let imported = client
             .rpc(iroh_share_proto::Import {
                 source: ticket.clone().try_into()?,

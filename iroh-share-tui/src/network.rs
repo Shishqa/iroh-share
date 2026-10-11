@@ -13,6 +13,12 @@ pub enum Action {
     Import {
         source: DownloadSource,
         id: Option<u64>,
+        /// False drops the top-level directory. True keeps the paths of new
+        /// data and the remembered layout of updated data.
+        include_directory_name: bool,
+        /// False keeps new data off Mainline from the start. True announces
+        /// new data and keeps the setting of updated data.
+        announce: bool,
     },
     Refresh(u64),
     Download {
@@ -29,6 +35,10 @@ pub enum Action {
         target: iroh_share_proto::NameTarget,
     },
     RemoveName(String),
+    SetAnnounce {
+        id: u64,
+        announce: bool,
+    },
 }
 
 pub enum Update {
@@ -37,6 +47,8 @@ pub enum Update {
         result: Result<iroh_share_proto::PathCompletions, String>,
     },
     ImportDirectory(PathBuf),
+    /// None when the daemon predates per-data announcement settings.
+    Announce(Option<iroh_share_proto::AnnounceSnapshot>),
     Added {
         job: iroh_share_proto::Job,
         new: bool,
@@ -111,10 +123,22 @@ async fn session(
     tokio::time::timeout(Duration::from_secs(15), snapshot)
         .await
         .context("initial snapshot timed out")??;
+    // Older daemons drop the probe's own connection; the session carries on without it.
+    let mut announce = client.watch_announce().await.ok();
     let mut completions = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = tx.closed() => return Ok(()),
+            snapshot = async { announce.as_mut().expect("guarded").recv().await }, if announce.is_some() => {
+                let snapshot = match snapshot {
+                    Ok(Some(Ok(snapshot))) => Some(snapshot),
+                    _ => {
+                        announce = None;
+                        None
+                    }
+                };
+                tx.send(Update::Announce(snapshot)).await?;
+            }
             event = events.recv() => {
                 let event = event?.context("daemon disconnected")?.map_err(anyhow::Error::msg)?;
                 tx.send(Update::Event(event)).await?;
@@ -144,10 +168,21 @@ async fn session(
                         Ok(job) => { tx.send(Update::Added { job, new: true }).await?; continue; }
                         Err(error) => Err(error),
                     },
-                    Action::Import { source, id } => match client.import(source, id).await {
-                        Ok(job) => { tx.send(Update::Added { job, new: id.is_none() }).await?; continue; }
-                        Err(error) => Err(error),
-                    },
+                    Action::Import { source, id, include_directory_name, announce } => {
+                        // The plain request also works with daemons that predate the options.
+                        let result = if include_directory_name && announce {
+                            client.import(source, id).await
+                        } else {
+                            client.import_with_options(source, id, include_directory_name, announce).await
+                        };
+                        match result {
+                            Ok(job) => { tx.send(Update::Added { job, new: id.is_none() }).await?; continue; }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Action::SetAnnounce { id, announce } => client.set_announce(id, announce).await.map(|()| {
+                        if announce { format!("Data {id} is announced on Mainline") } else { format!("Data {id} is no longer announced on Mainline; direct tickets still work") }
+                    }),
                     Action::Refresh(id) => client.refresh(id).await.map(|()| "Refresh requested; linked names will follow the updated content".into()),
                     Action::Download { source, target } => client.download(source, target).await.map(|job| format!("Added data {}", job.id)),
                     Action::Remove(id) => client.remove(id).await.map(|()| format!("Removed data {id}")),

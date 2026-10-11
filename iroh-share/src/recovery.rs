@@ -22,6 +22,9 @@ pub enum SavedData {
         source: DownloadSource,
         target: PathBuf,
         phase: DownloadPhase,
+        /// False seeds the collection without its single top-level directory.
+        #[serde(default = "included_directory_name")]
+        include_directory_name: bool,
     },
 }
 impl SavedData {
@@ -38,7 +41,32 @@ impl SavedData {
                 source: source.clone(),
                 target: target.clone(),
                 phase: DownloadPhase::Downloading,
+                include_directory_name: true,
             },
+        }
+    }
+    /// A ticket import, which may drop the collection's top-level directory.
+    pub fn import(kind: &JobKind, include_directory_name: bool) -> Self {
+        let mut saved = Self::new(kind);
+        if let Self::Download {
+            include_directory_name: value,
+            ..
+        } = &mut saved
+        {
+            *value = include_directory_name;
+        }
+        saved
+    }
+    pub fn include_directory_name(&self) -> bool {
+        match self {
+            Self::Share {
+                include_directory_name,
+                ..
+            }
+            | Self::Download {
+                include_directory_name,
+                ..
+            } => *include_directory_name,
         }
     }
     pub fn kind(&self) -> JobKind {
@@ -126,6 +154,31 @@ mod layout_tests {
             assert!(
                 matches!(restored.kind(), JobKind::Share { include_directory_name: value, .. } if value == include_directory_name)
             );
+        }
+    }
+
+    #[test]
+    fn import_layout_survives_storage_and_missing_option_keeps_directory_name() {
+        let kind = JobKind::Download {
+            source: DownloadSource {
+                hash: [0; 32].into(),
+                providers: Vec::new(),
+                discovery: iroh_share_proto::DiscoveryMode::Disabled,
+            },
+            target: "/data/t".into(),
+        };
+        let mut stored = serde_json::to_value(SavedData::import(&kind, false)).unwrap();
+        stored["Download"]
+            .as_object_mut()
+            .unwrap()
+            .remove("include_directory_name");
+        let saved: SavedData = serde_json::from_value(stored).unwrap();
+        assert!(saved.include_directory_name());
+        for include_directory_name in [false, true] {
+            let saved = SavedData::import(&kind, include_directory_name);
+            let restored: SavedData =
+                serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+            assert_eq!(restored.include_directory_name(), include_directory_name);
         }
     }
 }
