@@ -41,13 +41,12 @@ cargo install --path iroh-share-tui
 
 The daemon uses the original two-second directory polling by default. The
 `fs-watch` feature is an experimental opt-in prototype, not recommended for
-production yet; see the [current architecture review](docs/reviews/fs-watch-architecture-latest.md)
-and [executed validation](docs/reviews/fs-watch-validation.md).
+production yet.
 To build and install it (this replaces the binary, but does not restart a daemon):
 
 ```sh
 cargo install --path iroh-share --locked --features fs-watch --force
-# Or install this review branch directly:
+# Or install this feature branch directly:
 cargo install --git https://github.com/Shishqa/iroh-share \
   --branch feat/notify-refresh --locked --features fs-watch --force iroh-share
 ```
@@ -80,8 +79,7 @@ ongoing imports, slow filesystems, backpressure or Android sleep can delay work.
 Notifications do not make mutable referenced files into immutable snapshots.
 Native notifications currently run only on Linux/Android; other platforms use
 minute polling with this feature. Android cross-app writes and suspend/resume
-still need deployment-specific testing. See the
-[current review](docs/reviews/fs-watch-architecture-latest.md) for validation scope.
+still need deployment-specific testing. Battery savings have not been measured.
 
 To *browse* `blake3.net` and `pkarr.net` links, you also need
 [Iroh Link Gateway][gateway] and its browser extension.
